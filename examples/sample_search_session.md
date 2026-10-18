@@ -2,10 +2,12 @@
 
 A real session against the two tiny projects in this folder
 (`project_alpha` and `project_beta`), captured from the v0.1 CLI
-on the build machine. Root paths print absolute there; on your
-machine they will show your own paths. The database lives in a
-scratch folder for the demo; by default it would live in the
-local state dir, and `--db` chooses the file.
+on the build machine and refreshed Oct 18, 2026 so the output
+matches the current CLI exactly. Root paths print absolute there;
+on your machine they will show your own paths. The database lives
+in a scratch folder for the demo; by default it would live in the
+local state dir, and `--db` chooses the file. Match lines are
+marked with `>`; every token figure is an estimate.
 
 ```console
 $ ghostindex index examples/project_alpha examples/project_beta --db <scratch>/demo.db
@@ -20,9 +22,12 @@ Indexed /home/hatch/workspace/ghostindex/examples/project_beta
   estimator: estimates (BPE-like split v2, per-language calibrated, not exact tokenizer counts)
 ```
 
+One search spans both projects. The header counts every matching
+file before any cap applies (`3 of 3` here, so nothing was capped):
+
 ```console
 $ ghostindex search "sunflower festival" --db <scratch>/demo.db
-3 hit(s) for 'sunflower festival' (token figures are estimates)
+3 of 3 matching file(s) for 'sunflower festival' (token figures are estimates)
 
 1. src/ledger.py (python, match)
    root: /home/hatch/workspace/ghostindex/examples/project_beta
@@ -69,5 +74,6 @@ index database: /tmp/tmpdypgshwv/demo.db (53248 bytes)
 roots: 2, files: 5, source bytes: 604
 total content: ~173 estimated tokens
 estimator: estimates (BPE-like split v2, per-language calibrated, not exact tokenizer counts)
+search defaults: at most 10 hits, ~2000 total excerpt tokens, ~200 per hit (search output states when a cap binds)
 languages: python 2, markdown 2, text 1
 ```

@@ -17,17 +17,63 @@ from pathlib import Path
 from . import __version__, indexer, search as search_mod, store, tokens
 
 
+def _positive_int(value: str) -> int:
+    """argparse type for limits that must be at least 1.
+
+    Without this, --limit 0 reported "no matches" for files that do
+    match, a negative --limit fell through to sqlite's "no LIMIT"
+    semantics, and a zero or negative --max-tokens was silently
+    ignored. Bad values are usage errors (exit 2), never a search
+    that quietly lies.
+    """
+    try:
+        number = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"must be an integer, got {value!r}") from None
+    if number < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return number
+
+
+def _non_negative_int(value: str) -> int:
+    """argparse type for counts that may be 0 but never negative
+    (a negative --context produced empty excerpts labelled with
+    inverted line ranges; a negative --max-bytes indexed nothing
+    and reported success)."""
+    try:
+        number = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"must be an integer, got {value!r}") from None
+    if number < 0:
+        raise argparse.ArgumentTypeError("must be at least 0")
+    return number
+
+
 def _db_path(args) -> Path:
+    """Resolve the index database path for one command invocation.
+
+    An explicit ``--db`` flag wins; otherwise the store default
+    applies (``$GHOSTINDEX_DB``, else the local state dir).
+    """
     if getattr(args, "db", None):
         return Path(args.db).expanduser()
     return store.default_db_path()
 
 
 def _open(args, create: bool) -> sqlite3.Connection:
+    """Open the index store for a command.
+
+    ``create=True`` (index/update) creates and initialises the
+    database when missing; read-only commands pass ``False`` so a
+    missing index is an error (exit 2), never a silent empty result.
+    """
     return store.open_store(_db_path(args), create=create)
 
 
 def _print_update(report: indexer.UpdateReport, as_json: bool) -> None:
+    """Print one root's index/update report, as text or JSON."""
     if as_json:
         print(json.dumps(report.as_dict(), indent=2))
         return
@@ -51,6 +97,8 @@ def _print_update(report: indexer.UpdateReport, as_json: bool) -> None:
 
 
 def cmd_index(args) -> int:
+    """``index``: index (or re-index) each named root. Exit 2 when a
+    named path is not a directory or the store cannot be opened."""
     try:
         conn = _open(args, create=True)
     except store.StoreError as exc:
@@ -72,6 +120,9 @@ def cmd_index(args) -> int:
 
 
 def cmd_update(args) -> int:
+    """``update``: incrementally re-index named roots, or every
+    indexed root when none are named. Same code path as ``index``;
+    unchanged files are recognised by size, mtime, then sha256."""
     try:
         conn = _open(args, create=True)
     except store.StoreError as exc:
@@ -113,6 +164,8 @@ def _search_defaults() -> dict:
 
 
 def _print_hit(position: int, hit: search_mod.Hit) -> None:
+    """Print one search hit: header, token estimates, then each
+    excerpt window with match lines marked ``>``."""
     kind = "name match" if hit.name_only else "match"
     print(f"{position}. {hit.rel} ({hit.language}, {kind})")
     print(f"   root: {hit.root}")
@@ -150,6 +203,8 @@ def _cap_notice(result: search_mod.SearchResult) -> str:
 
 
 def cmd_search(args) -> int:
+    """``search``: ranked search over the index. Exit 0 = matches
+    found, 1 = no matches, 2 = the search could not run."""
     try:
         conn = _open(args, create=False)
     except store.StoreError as exc:
@@ -195,6 +250,8 @@ def cmd_search(args) -> int:
 
 
 def _root_rows(conn) -> list[dict]:
+    """One summary dict per indexed root (files, estimated tokens,
+    last indexed time, whether the root still exists on disk)."""
     rows = []
     for row in conn.execute(
         "SELECT p.root, p.indexed_at, p.token_method,"
@@ -214,6 +271,7 @@ def _root_rows(conn) -> list[dict]:
 
 
 def cmd_list(args) -> int:
+    """``list``: show every indexed root and its summary."""
     try:
         conn = _open(args, create=False)
     except store.StoreError as exc:
@@ -235,6 +293,8 @@ def cmd_list(args) -> int:
 
 
 def cmd_stats(args) -> int:
+    """``stats``: database size, totals, and per-root / per-language
+    breakdowns, plus the search defaults in force."""
     try:
         conn = _open(args, create=False)
     except store.StoreError as exc:
@@ -290,6 +350,9 @@ def cmd_stats(args) -> int:
 
 
 def cmd_remove(args) -> int:
+    """``remove``: drop one root from the index and vacuum, so its
+    space is reclaimed. Project files are never touched. Exit 1
+    when the root is not in the index."""
     try:
         conn = _open(args, create=False)
     except store.StoreError as exc:
@@ -316,6 +379,8 @@ def cmd_remove(args) -> int:
 
 
 def cmd_vacuum(args) -> int:
+    """``vacuum``: compact the database, reclaiming freelist space
+    left by removed or changed files, without dropping any root."""
     try:
         conn = _open(args, create=False)
     except store.StoreError as exc:
@@ -342,6 +407,9 @@ def cmd_vacuum(args) -> int:
 
 
 def cmd_doctor(args) -> int:
+    """``doctor``: health check (sqlite, FTS5, database, roots).
+    Exit 0 when healthy, 2 when FTS5 is missing or the index
+    cannot be read."""
     db = _db_path(args)
     report: dict = {
         "db_path": str(db),
@@ -363,7 +431,9 @@ def cmd_doctor(args) -> int:
             conn = store.open_store(db, create=False)
             roots = _root_rows(conn)
             conn.close()
-        except store.StoreError as exc:
+        except (store.StoreError, sqlite3.Error) as exc:
+            # A corrupt database is exactly what doctor exists to
+            # diagnose: report it, do not die with a traceback.
             report["error"] = str(exc)
             healthy = False
     report["roots"] = roots
@@ -392,10 +462,29 @@ def cmd_doctor(args) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """Build the argument parser for all eight subcommands.
+
+    Every subcommand accepts ``--db`` (after the subcommand name).
+    Defaults shown in help text are read from the same constants the
+    commands run with, so the help cannot drift from the behaviour.
+    """
     parser = argparse.ArgumentParser(
         prog="ghostindex",
         description="Cross-project local search index for GhostSlice "
                     "(sqlite FTS5, offline, sliced excerpts).",
+        epilog="examples:\n"
+               "  ghostindex index ~/code/project-a ~/code/project-b\n"
+               "  ghostindex search \"quixotic login\"\n"
+               "  ghostindex search \"auth*\" --root ~/code/project-a --json\n"
+               "  ghostindex update            # re-index every known root\n"
+               "  ghostindex stats\n"
+               "\n"
+               "The index database defaults to the local state dir\n"
+               "(~/.local/state/ghostindex/index.db); choose it per command\n"
+               "with --db <path> or for the shell with $GHOSTINDEX_DB.\n"
+               "Nothing is indexed that you did not name, project trees are\n"
+               "never written to, and there is no network code.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--version", action="version",
                         version=f"ghostindex {__version__}")
@@ -406,70 +495,163 @@ def build_parser() -> argparse.ArgumentParser:
                        help="index database path (default: state dir, "
                             "or $GHOSTINDEX_DB)")
 
-    p = sub.add_parser("index", help="index one or more project roots")
+    def json_arg(p):
+        p.add_argument("--json", action="store_true",
+                       help="print machine-readable JSON output")
+
+    p = sub.add_parser(
+        "index", help="index one or more project roots",
+        description="Index one or more project roots you name. Files "
+                    "matched by ignore rules, binary files, and files "
+                    "over --max-bytes are skipped and never become "
+                    "searchable. Re-running index on a known root is "
+                    "an incremental update (same counts as update).",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
     db_arg(p)
-    p.add_argument("--max-bytes", type=int, default=indexer.DEFAULT_MAX_BYTES,
-                   help="skip files larger than this (default 2 MiB)")
-    p.add_argument("--json", action="store_true")
-    p.add_argument("roots", nargs="+")
+    p.add_argument("--max-bytes", type=_non_negative_int,
+                   default=indexer.DEFAULT_MAX_BYTES,
+                   help="skip files larger than this many bytes "
+                        "(default: %(default)s, 2 MiB)")
+    json_arg(p)
+    p.add_argument("roots", nargs="+",
+                   help="project root directories to index")
     p.set_defaults(func=cmd_index)
 
-    p = sub.add_parser("update", help="incrementally re-index by file hash")
+    p = sub.add_parser(
+        "update", help="incrementally re-index by file hash",
+        description="Incrementally re-index by size, mtime, then sha256. "
+                    "Only new or changed files are re-read; vanished "
+                    "files are dropped. Prints exact added / changed / "
+                    "removed / unchanged counts per root.",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
     db_arg(p)
-    p.add_argument("--max-bytes", type=int, default=indexer.DEFAULT_MAX_BYTES)
-    p.add_argument("--json", action="store_true")
+    p.add_argument("--max-bytes", type=_non_negative_int,
+                   default=indexer.DEFAULT_MAX_BYTES,
+                   help="skip files larger than this many bytes "
+                        "(default: %(default)s, 2 MiB)")
+    json_arg(p)
     p.add_argument("roots", nargs="*",
                    help="roots to update (default: all indexed roots)")
     p.set_defaults(func=cmd_update)
 
-    p = sub.add_parser("search", help="ranked search returning sliced excerpts")
+    p = sub.add_parser(
+        "search", help="ranked search returning sliced excerpts",
+        description="Ranked keyword search (sqlite FTS5, bm25) returning "
+                    "bounded excerpts, never whole files. By default a "
+                    "file must contain ALL query terms; a term ending "
+                    "in * is a prefix term. Output always states how "
+                    "many files matched and names any cap that bound.",
+        epilog="exit codes: 0 = matches found, 1 = no matches, "
+               "2 = the search could not run (no index at that path, "
+               "a root that is not indexed, or FTS5 unavailable).",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
     db_arg(p)
-    p.add_argument("query")
-    p.add_argument("--root", default=None, help="restrict to one indexed root")
-    p.add_argument("--limit", type=int, default=search_mod.DEFAULT_LIMIT)
-    p.add_argument("--context", type=int, default=search_mod.DEFAULT_CONTEXT,
-                   help="context lines around each match line")
+    p.add_argument("query",
+                   help="search terms, quoted as one string, "
+                        "e.g. \"quixotic login\"; terms are AND by "
+                        "default, \"two words\" is a phrase, a term "
+                        "ending in * is a prefix match, and -term, "
+                        "-term* or -\"two words\" excludes files "
+                        "containing that term or phrase")
+    p.add_argument("--root", default=None,
+                   help="restrict to one indexed root (must already "
+                        "be in the index)")
+    p.add_argument("--limit", type=_positive_int,
+                   default=search_mod.DEFAULT_LIMIT,
+                   help="maximum number of hits to show "
+                        "(default: %(default)s)")
+    p.add_argument("--context", type=_non_negative_int,
+                   default=search_mod.DEFAULT_CONTEXT,
+                   help="context lines around each match line "
+                        "(default: %(default)s)")
     p.add_argument("--any", action="store_true",
                    help="match files containing ANY term (default: ALL terms)")
-    p.add_argument("--max-tokens", type=int,
+    p.add_argument("--max-tokens", type=_positive_int,
                    default=search_mod.DEFAULT_TOTAL_TOKENS,
-                   help="total excerpt token budget across hits")
-    p.add_argument("--json", action="store_true")
+                   help="total excerpt token budget across hits, in "
+                        "estimated tokens (default: %(default)s)")
+    json_arg(p)
     p.set_defaults(func=cmd_search)
 
-    p = sub.add_parser("list", help="list indexed roots")
+    p = sub.add_parser(
+        "list", help="list indexed roots",
+        description="List every indexed root with its file count, "
+                    "estimated tokens, and last indexed time. Roots "
+                    "that no longer exist on disk are flagged.",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
     db_arg(p)
-    p.add_argument("--json", action="store_true")
+    json_arg(p)
     p.set_defaults(func=cmd_list)
 
-    p = sub.add_parser("stats", help="index statistics")
+    p = sub.add_parser(
+        "stats", help="index statistics",
+        description="Show the database path and size, totals, a "
+                    "per-root and per-language breakdown, any space "
+                    "reclaimable by vacuum, and the search defaults "
+                    "in force.",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
     db_arg(p)
-    p.add_argument("--json", action="store_true")
+    json_arg(p)
     p.set_defaults(func=cmd_stats)
 
-    p = sub.add_parser("remove", help="drop one root from the index")
+    p = sub.add_parser(
+        "remove", help="drop one root from the index",
+        description="Drop one root from the index and compact the "
+                    "database so its space is reclaimed. Nothing in "
+                    "the project itself is deleted. Exit 1 when the "
+                    "root is not in the index.",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
     db_arg(p)
-    p.add_argument("root")
+    p.add_argument("root", help="indexed root to drop from the index")
     p.set_defaults(func=cmd_remove)
 
-    p = sub.add_parser("vacuum",
-                       help="compact the index database, reclaiming "
-                            "space left by removed or changed files")
+    p = sub.add_parser(
+        "vacuum",
+        help="compact the index database, reclaiming "
+             "space left by removed or changed files",
+        description="Compact the index database (sqlite VACUUM), "
+                    "reclaiming space left behind by removed or "
+                    "changed files, without dropping any root.",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
     db_arg(p)
-    p.add_argument("--json", action="store_true")
+    json_arg(p)
     p.set_defaults(func=cmd_vacuum)
 
-    p = sub.add_parser("doctor", help="check sqlite/FTS5, db, and roots")
+    p = sub.add_parser(
+        "doctor", help="check sqlite/FTS5, db, and roots",
+        description="Report the sqlite version, FTS5 availability, "
+                    "database path and size, the estimator in force, "
+                    "the search defaults, and any indexed root missing "
+                    "from disk. Exit 0 when healthy, 2 otherwise.",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
     db_arg(p)
-    p.add_argument("--json", action="store_true")
+    json_arg(p)
     p.set_defaults(func=cmd_doctor)
 
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
+    """CLI entry point. Returns the subcommand's exit code (see the
+    module docstring); ``--version`` and ``--help`` exit via argparse."""
     args = build_parser().parse_args(argv)
-    return args.func(args)
+    try:
+        return args.func(args)
+    except store.StoreError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except sqlite3.Error as exc:
+        # A database file that exists but is not a readable index
+        # (corrupt, truncated, or not sqlite at all) surfaces here,
+        # at the first real query: the contract is exit 2 ("could
+        # not run") with a plain error, never a traceback, and never
+        # exit 1, which search reserves for "no matches".
+        print(f"error: index database is unreadable or corrupt: {exc}",
+              file=sys.stderr)
+        return 2
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

@@ -55,10 +55,15 @@ CREATE VIRTUAL TABLE IF NOT EXISTS docs USING fts5(
 
 
 class StoreError(Exception):
-    pass
+    """The index database cannot be opened, is missing when a
+    read-only command needs it, or FTS5 is unavailable. The CLI
+    reports it as ``error: ...`` and exits 2."""
 
 
 def default_db_path() -> Path:
+    """Default database location: ``$GHOSTINDEX_DB`` when set, else
+    ``$XDG_STATE_HOME/ghostindex/index.db``, else
+    ``~/.local/state/ghostindex/index.db``."""
     env = os.environ.get("GHOSTINDEX_DB")
     if env:
         return Path(env).expanduser()
@@ -96,6 +101,9 @@ def freelist_bytes(conn: sqlite3.Connection) -> int:
 
 
 def fts5_available(conn: sqlite3.Connection) -> bool:
+    """Probe ``conn`` for FTS5 support by creating and dropping a
+    throwaway virtual table. False means this Python/sqlite build
+    cannot run GhostIndex at all."""
     try:
         conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS _gi_fts_probe USING fts5(x)")
         conn.execute("DROP TABLE IF EXISTS _gi_fts_probe")
@@ -105,7 +113,12 @@ def fts5_available(conn: sqlite3.Connection) -> bool:
 
 
 def open_store(db_path: Path, create: bool = True) -> sqlite3.Connection:
-    """Open (and if ``create``, initialise) the index database."""
+    """Open (and if ``create``, initialise) the index database.
+
+    Raises :class:`StoreError` when the file is missing and
+    ``create`` is False, when it cannot be opened, or (with
+    ``create``) when FTS5 is unavailable.
+    """
     if not create and not db_path.is_file():
         raise StoreError(f"no index database at {db_path} (run: ghostindex index <root>)")
     try:
@@ -115,16 +128,34 @@ def open_store(db_path: Path, create: bool = True) -> sqlite3.Connection:
         raise StoreError(f"cannot open index database at {db_path}: {exc}") from exc
     conn.row_factory = sqlite3.Row
     if create:
+        try:
+            conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()
+        except sqlite3.Error as exc:
+            # The file exists but is not a database. Without this
+            # probe the FTS5 check below fails on it too and the
+            # corruption is misreported as "FTS5 not available".
+            conn.close()
+            raise StoreError(
+                f"index database at {db_path} is unreadable or corrupt: {exc}"
+            ) from exc
         if not fts5_available(conn):
             conn.close()
             raise StoreError(
                 "sqlite FTS5 is not available in this Python build; "
                 "GhostIndex cannot run"
             )
-        conn.executescript(_SCHEMA)
-        conn.execute(
-            "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?)",
-            (str(SCHEMA_VERSION),),
-        )
-        conn.commit()
+        try:
+            conn.executescript(_SCHEMA)
+            conn.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?)",
+                (str(SCHEMA_VERSION),),
+            )
+            conn.commit()
+        except sqlite3.Error as exc:
+            # E.g. the file at db_path exists but is not a database:
+            # report it as a StoreError, not a raw traceback.
+            conn.close()
+            raise StoreError(
+                f"index database at {db_path} is unreadable or corrupt: {exc}"
+            ) from exc
     return conn

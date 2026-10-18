@@ -65,22 +65,48 @@ LANGUAGE_BY_EXT = {
 
 
 def language_for(path: str) -> str:
+    """Language name for a file path, from its extension (the same
+    map GhostSlice uses). Unknown extensions report ``"text"``."""
     return LANGUAGE_BY_EXT.get(Path(path).suffix.lower(), "text")
 
 
 def _glob_to_regex(pattern: str) -> re.Pattern:
-    """Translate one gitignore glob body to a regex (full match)."""
+    """Translate one gitignore glob body to a regex (full match).
+
+    ``**`` only crosses directories at a path-segment boundary:
+    a leading or medial ``**/`` matches zero or more whole
+    directories (so ``**/foo`` matches ``foo`` and ``a/foo`` but
+    never ``afoo``, and ``a/**/b`` matches ``a/b`` and ``a/x/b``
+    but never ``a/xb``), and a trailing ``/**`` matches everything
+    under the directory. A ``**`` anywhere else is an ordinary
+    ``*``. Character classes follow git: ``[!...]`` negates the
+    class, a ``]`` in first position is a literal, and a backslash
+    escapes the next character.
+    """
     out: list[str] = []
     i = 0
-    while i < len(pattern):
+    n = len(pattern)
+    while i < n:
         ch = pattern[i]
         if ch == "*":
             if pattern[i:i + 2] == "**":
-                # ** crosses directories; absorb a following slash.
-                out.append(".*")
+                at_segment = i == 0 or pattern[i - 1] == "/"
+                if pattern.startswith("**/", i) and at_segment:
+                    # Zero or more whole directories. A preceding
+                    # "/" has already been emitted, so "a/**/b"
+                    # becomes "a/" + "(?:[^/]+/)*" + "b".
+                    out.append("(?:[^/]+/)*")
+                    i += 3
+                    continue
+                if i + 2 == n and at_segment:
+                    # Trailing "/**" (the slash is already emitted)
+                    # or a bare "**": everything from here on.
+                    out.append(".*")
+                    i += 2
+                    continue
+                # Not at a segment boundary: an ordinary star.
+                out.append("[^/]*")
                 i += 2
-                if i < len(pattern) and pattern[i] == "/":
-                    i += 1
                 continue
             out.append("[^/]*")
             i += 1
@@ -88,13 +114,28 @@ def _glob_to_regex(pattern: str) -> re.Pattern:
             out.append("[^/]")
             i += 1
         elif ch == "[":
-            j = pattern.find("]", i + 1)
-            if j == -1:
+            j = i + 1
+            if j < n and pattern[j] == "!":
+                j += 1
+            if j < n and pattern[j] == "]":
+                j += 1  # a "]" in first position is a literal
+            while j < n and pattern[j] != "]":
+                j += 1
+            if j >= n:
                 out.append(re.escape(ch))
                 i += 1
             else:
-                out.append(pattern[i:j + 1])
+                raw = pattern[i + 1:j]
+                negated = raw.startswith("!")
+                body = raw[1:] if negated else raw
+                body = body.replace("\\", "\\\\")
+                if not negated and body.startswith("^"):
+                    body = "\\" + body  # "^" is a literal in glob classes
+                out.append("[" + ("^" if negated else "") + body + "]")
                 i = j + 1
+        elif ch == "\\" and i + 1 < n:
+            out.append(re.escape(pattern[i + 1]))
+            i += 2
         else:
             out.append(re.escape(ch))
             i += 1
@@ -117,6 +158,9 @@ class GitignoreMatcher:
         self._rules: list[_Rule] = []
 
     def load_dir(self, dirpath: Path, base_rel: str) -> None:
+        """Load the ``.gitignore`` in ``dirpath`` (if any), scoped to
+        the subtree named by ``base_rel``. Rules append in walk
+        order, which is what makes last-match-wins work."""
         gi = dirpath / ".gitignore"
         try:
             lines = gi.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -141,6 +185,9 @@ class GitignoreMatcher:
                                      negated, dir_only, anchored))
 
     def ignored(self, rel: str, is_dir: bool = False) -> bool:
+        """True when the last matching rule ignores ``rel`` (a posix
+        path relative to the root). Directory-only rules only apply
+        when ``is_dir`` is set."""
         result = False
         for rule in self._rules:
             if rule.dir_only and not is_dir:
@@ -218,6 +265,54 @@ class WalkResult:
     skips: SkipStats = field(default_factory=SkipStats)
 
 
+def _symlink_target_excluded(full: Path, root: Path,
+                             profile_ignores: list[str],
+                             skip_paths: set[Path]) -> bool:
+    """True when a symlinked file must not be indexed through its link.
+
+    A link whose own name looks indexable must not smuggle in content
+    the walker would never index at the target's own path: anything
+    outside the root, the index database itself, a target under a
+    default ignore dir or with a binary extension, and any target
+    matched by a .gitignore rule or the profile ignore list. The
+    target is judged by a fresh matcher loaded along its own ancestor
+    chain, because the walk may not have visited that subtree yet.
+    """
+    try:
+        target = full.resolve()
+    except (OSError, RuntimeError):
+        # RuntimeError: Path.resolve() reports a symlink loop that way.
+        return True
+    try:
+        target_rel_path = target.relative_to(root)
+    except ValueError:
+        return True  # outside the root
+    if target in skip_paths:
+        return True
+    if not target.is_file():
+        return True  # broken link, or a link to a directory
+    target_rel = target_rel_path.as_posix()
+    parts = target_rel_path.parts
+    if any(part in DEFAULT_IGNORE_DIRS for part in parts[:-1]):
+        return True
+    if target.name in DEFAULT_IGNORE_FILES:
+        return True
+    if target.suffix.lower() in BINARY_EXTS:
+        return True
+    matcher = GitignoreMatcher()
+    matcher.load_dir(root, "")
+    prefix = ""
+    for part in parts[:-1]:
+        prefix = f"{prefix}/{part}" if prefix else part
+        if matcher.ignored(prefix, is_dir=True) or _profile_ignored(
+                profile_ignores, prefix):
+            return True
+        matcher.load_dir(root / prefix, prefix)
+    if matcher.ignored(target_rel):
+        return True
+    return _profile_ignored(profile_ignores, target_rel)
+
+
 def walk(root: Path, extra_skip_paths: set[Path] | None = None) -> WalkResult:
     """Collect indexable files under root, honouring all ignore rules.
 
@@ -264,7 +359,9 @@ def walk(root: Path, extra_skip_paths: set[Path] | None = None) -> WalkResult:
                     if full.resolve() in skip_paths:
                         result.skips.default_files += 1
                         continue
-                except OSError:
+                except (OSError, RuntimeError):
+                    # RuntimeError: a symlink loop; the symlink
+                    # handling below excludes it.
                     pass
             if Path(name).suffix.lower() in BINARY_EXTS:
                 result.skips.binary_ext += 1
@@ -273,9 +370,8 @@ def walk(root: Path, extra_skip_paths: set[Path] | None = None) -> WalkResult:
                 result.skips.ignored_files += 1
                 continue
             if full.is_symlink():
-                try:
-                    full.resolve().relative_to(root)
-                except (ValueError, OSError):
+                if _symlink_target_excluded(full, root, profile_ignores,
+                                            skip_paths):
                     result.skips.symlinks += 1
                     continue
             try:

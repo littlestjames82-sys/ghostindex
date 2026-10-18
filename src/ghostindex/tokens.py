@@ -83,6 +83,8 @@ def _raw_split(text: str) -> int:
 
 
 def using_ghostslice() -> bool:
+    """True when the calibrated GhostSlice estimator was loaded;
+    False when the documented fallback estimator is in force."""
     return _gs_estimate is not None
 
 
@@ -94,6 +96,10 @@ def method() -> str:
 
 
 def estimate_tokens(text: str, language: str | None = None) -> int:
+    """Estimate the token count of ``text``. The result is always
+    an estimate (see :func:`method`), never an exact tokenizer
+    count; ``language`` lets the calibrated estimator apply its
+    per-language factor."""
     if _gs_estimate is not None:
         return _gs_estimate(text, language)
     return _raw_split(text)

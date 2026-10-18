@@ -23,6 +23,11 @@ _SNIFF_BYTES = 8192
 
 @dataclass
 class UpdateReport:
+    """Exact outcome of indexing one root. Counts are reported, not
+    summarised away, so "the update did nothing" is provable:
+    a no-change run shows ``unchanged`` for every file and zero
+    for added / changed / removed."""
+
     root: str
     added: int = 0
     changed: int = 0
@@ -36,6 +41,7 @@ class UpdateReport:
     total_tokens: int = 0
 
     def as_dict(self) -> dict:
+        """The report as printed by ``index --json`` / ``update --json``."""
         return {
             "root": self.root,
             "added": self.added,
@@ -66,6 +72,8 @@ def index_root(
     root = root.resolve()
     if not root.is_dir():
         raise NotADirectoryError(f"not a directory: {root}")
+    if max_bytes < 0:
+        raise ValueError("max_bytes must be at least 0")
     root_str = str(root)
     report = UpdateReport(root=root_str)
 
@@ -102,6 +110,13 @@ def index_root(
             data = cand.abspath.read_bytes()
         except OSError:
             report.skipped_unreadable += 1
+            continue
+        if len(data) > max_bytes:
+            # The size cap is re-checked on the bytes actually read:
+            # the walker's stat can be stale (a file that grew after
+            # it was statted, or a link whose target changed), and a
+            # stale small stat must not let oversized content in.
+            report.skipped_too_large += 1
             continue
         digest = hashlib.sha256(data).hexdigest()
         if old is not None and old["sha256"] == digest:
@@ -184,5 +199,6 @@ def remove_root(conn: sqlite3.Connection, root: Path) -> int:
 
 
 def known_roots(conn: sqlite3.Connection) -> list[str]:
+    """Every root currently in the index, sorted by path."""
     return [row["root"] for row in conn.execute(
         "SELECT root FROM projects ORDER BY root")]

@@ -1,4 +1,5 @@
 # GhostIndex
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 **Find which project, and which file, holds the thing you half remember, before you slice anything.**
 
@@ -119,3 +120,16 @@ Reading one hit, top to bottom: the numbered line gives the relative path, langu
 | `src/ghostindex/` | The core: scanner, store (sqlite FTS5), indexer, search, CLI |
 | `tests/` | Black-box CLI tests, fixture projects, hard-rule proofs |
 | `examples/` | Two tiny fixture projects and a captured sample session |
+
+---
+<!-- ghost-studio-footer -->
+## More from Ghost Developer Studio
+
+Ghost Developer Studio builds developer tools, AI-agent safety software, and practical apps, and sells by showing working software, not slide decks.
+
+- [Roadmap board](https://github.com/littlestjames82-sys/ghost-roadmaps): where every studio product stands
+- [Agent Seatbelt](https://github.com/littlestjames82-sys/agent-seatbelt): deterministic guardrails for AI coding agents
+- [Ghost Hands](https://github.com/littlestjames82-sys/ghost-hands): governed, recorded, replayable agent hands
+- [GhostSlice](https://github.com/littlestjames82-sys/ghostslice): agent context and prompt optimizer
+- [GhostIDE](https://github.com/littlestjames82-sys/ghostide-android): fully offline AI code editor for Android
+- [All studio projects](https://github.com/littlestjames82-sys?tab=repositories)

@@ -1,5 +1,6 @@
 # GhostIndex
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![CI](https://github.com/littlestjames82-sys/ghostindex/actions/workflows/ci.yml/badge.svg)](https://github.com/littlestjames82-sys/ghostindex/actions/workflows/ci.yml/actions)
 
 **Find which project, and which file, holds the thing you half remember, before you slice anything.**
 
